@@ -1,6 +1,5 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import * as XLSX from "xlsx";
-import mammoth from "mammoth";
 
 const C = {
   navy:"#0D1B2A", navyMid:"#1B3A5C", steel:"#2E5F8A",
@@ -64,11 +63,13 @@ const FAMILY_NAMES = {
 };
 const PHASE_LABELS = ["Gap Analysis","SSP/Policy","Evidence","eMASS Entry","AO Review"];
 
+// Maximum characters sent to the LLM for control extraction.
+// Covers the vast majority of real SSPs. Documents larger than this
+// will be truncated with a warning logged to the activity console.
+const MAX_SSP_EXTRACT_CHARS = 80000;
 
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-// Robustly extract a JSON array/object from an LLM response that may
-// contain markdown fences, leading/trailing prose, or other chatter.
 function extractJSON(raw) {
   if (!raw) return null;
   let text = raw.trim();
@@ -86,17 +87,36 @@ function extractJSON(raw) {
   return null;
 }
 
-// All LLM calls go through our own backend at /api/chat.
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 
-async function callClaude(system, user, maxTokens=900) {
+// ── Auth token management ─────────────────────────────────────────
+// Stored in sessionStorage so it survives page refreshes but not
+// new tabs / windows (appropriate for a shared-workstation tool).
+function getStoredToken() {
+  try { return sessionStorage.getItem("rmf-auth-token") || ""; } catch { return ""; }
+}
+function storeToken(t) {
+  try { sessionStorage.setItem("rmf-auth-token", t); } catch {}
+}
+
+// Build headers for JSON API calls, injecting auth token if present.
+function jsonHeaders(token) {
+  const h = { "Content-Type": "application/json" };
+  if (token) h["X-Api-Key"] = token;
+  return h;
+}
+
+// ── LLM proxy ────────────────────────────────────────────────────
+async function callClaude(system, user, maxTokens=900, token="") {
   for (let attempt=0; attempt<4; attempt++) {
     try {
       const resp = await fetch(`${API_BASE}/api/chat`, {
-        method:"POST", headers:{"Content-Type":"application/json"},
+        method:"POST",
+        headers: jsonHeaders(token),
         body: JSON.stringify({ system, user, maxTokens }),
       });
       if (resp.status===529 || resp.status===429) { await sleep((attempt+1)*5000); continue; }
+      if (resp.status===401) throw new Error("AUTH_REQUIRED");
       if (!resp.ok) {
         const errBody = await resp.json().catch(()=>({}));
         throw new Error(errBody.error || `Backend returned ${resp.status}`);
@@ -104,6 +124,7 @@ async function callClaude(system, user, maxTokens=900) {
       const data = await resp.json();
       return data.text ?? "";
     } catch (e) {
+      if (e.message==="AUTH_REQUIRED") throw e;
       if(attempt===3) throw new Error(`LLM call failed after 4 attempts: ${e.message}`);
       await sleep((attempt+1)*3000);
     }
@@ -111,16 +132,14 @@ async function callClaude(system, user, maxTokens=900) {
   return "";
 }
 
-// ── NIST catalog lookup (official Control Text + Discussion) ─────────────────
-// Backend serves /api/catalog/:id from the bundled SP 800-53 Rev 5 catalog.
-// Used to ground the AI's gap analysis in the real control text, and to
-// populate the Guidance column with NIST's actual Discussion text (no AI
-// generation needed for that field).
+// ── NIST catalog lookup ───────────────────────────────────────────
 const catalogCache = {};
-async function getCatalogEntry(controlId) {
+async function getCatalogEntry(controlId, token="") {
   if (catalogCache[controlId] !== undefined) return catalogCache[controlId];
   try {
-    const r = await fetch(`${API_BASE}/api/catalog/${encodeURIComponent(controlId)}`);
+    const h = {};
+    if (token) h["X-Api-Key"] = token;
+    const r = await fetch(`${API_BASE}/api/catalog/${encodeURIComponent(controlId)}`, { headers: h });
     if (!r.ok) { catalogCache[controlId] = null; return null; }
     const data = await r.json();
     catalogCache[controlId] = data;
@@ -140,14 +159,29 @@ async function processBatch(items, size, delay, fn, onProgress) {
   return out;
 }
 
-async function parseSSPFiles(files) {
-  let combined = "";
+// ── Document parsing (server-side) ───────────────────────────────
+// Accepts .docx, .pdf, and .txt files. Parsing is handled by the
+// backend so the browser bundle stays lightweight and PDF support
+// doesn't require a heavy client-side dependency.
+async function parseSSPFiles(files, token="") {
+  const formData = new FormData();
   for (const file of Array.from(files)) {
-    const buf = await file.arrayBuffer();
-    const { value } = await mammoth.extractRawText({ arrayBuffer: buf });
-    combined += `\n\n=== SSP SECTION: ${file.name} ===\n\n${value}`;
+    formData.append("files", file);
   }
-  return combined;
+  const headers = {};
+  if (token) headers["X-Api-Key"] = token;
+  const resp = await fetch(`${API_BASE}/api/parse-document`, {
+    method: "POST",
+    headers,
+    body: formData,
+  });
+  if (resp.status === 401) throw new Error("AUTH_REQUIRED");
+  if (!resp.ok) {
+    const err = await resp.json().catch(()=>({}));
+    throw new Error(err.error || `Document parsing failed (${resp.status})`);
+  }
+  const { text } = await resp.json();
+  return text;
 }
 
 function downloadExcel(rows, filename, sheetName) {
@@ -157,16 +191,20 @@ function downloadExcel(rows, filename, sheetName) {
   XLSX.writeFile(wb, filename);
 }
 
-// ── Persistent storage helpers (backed by local JSON file via API) ───────────
-async function loadAllControls() {
+// ── Persistent storage helpers ────────────────────────────────────
+async function loadAllControls(token="") {
   try {
-    const listResp = await fetch(`${API_BASE}/api/storage?prefix=ctrl:`);
+    const listResp = await fetch(`${API_BASE}/api/storage?prefix=ctrl:`, {
+      headers: token ? { "X-Api-Key": token } : {},
+    });
     const { keys } = await listResp.json();
     if (!keys || keys.length===0) return {};
     const out = {};
     for (const key of keys) {
       try {
-        const r = await fetch(`${API_BASE}/api/storage/${encodeURIComponent(key)}`);
+        const r = await fetch(`${API_BASE}/api/storage/${encodeURIComponent(key)}`, {
+          headers: token ? { "X-Api-Key": token } : {},
+        });
         if (!r.ok) continue;
         const { value } = await r.json();
         out[key.replace("ctrl:","")] = JSON.parse(value);
@@ -175,24 +213,28 @@ async function loadAllControls() {
     return out;
   } catch { return {}; }
 }
-async function saveControl(controlId, data) {
+
+async function saveControl(controlId, data, token="") {
   try {
     await fetch(`${API_BASE}/api/storage`, {
-      method:"POST", headers:{"Content-Type":"application/json"},
+      method:"POST",
+      headers: jsonHeaders(token),
       body: JSON.stringify({ key:"ctrl:"+controlId, value: JSON.stringify(data) }),
     });
   } catch {}
 }
-async function clearAllControls() {
+
+async function clearAllControls(token="") {
   try {
     await fetch(`${API_BASE}/api/storage/clear`, {
-      method:"POST", headers:{"Content-Type":"application/json"},
+      method:"POST",
+      headers: jsonHeaders(token),
       body: JSON.stringify({ prefix:"ctrl:" }),
     });
   } catch {}
 }
 
-// ── Fixed SCTM format: 20 tabs (one per family), standard headers ────────────
+// ── SCTM workbook ─────────────────────────────────────────────────
 const SCTM_HEADERS = ["Control ID","Control Family","Implementation Status","Control Origination",
   "Implementation Statement","Test Method","Gap Flag","Gap Reason","AI Suggestion","Guidance"];
 
@@ -217,7 +259,7 @@ function buildSCTMWorkbook(allControls, documentedIds) {
   return wb;
 }
 
-// ── Fixed eMASS format: one row per BASE control, enhancements rolled up ─────
+// ── eMASS workbook ────────────────────────────────────────────────
 const EMASS_HEADERS = ["Control_Acronym","Control_Information","Implementation_Status",
   "Security_Control_Designation","Assessment_Procedures","Inherited",
   "Implementation_Narrative","Responsible_Entities","Planned_Implementation_Date","Test_Results","CCI"];
@@ -229,8 +271,6 @@ function baseControlId(id) {
   return m ? m[1] : id;
 }
 
-// Roll up a base control + any documented enhancements into one eMASS row.
-// Narrative is truncated to the 2000-char eMASS limit.
 function buildEmassRows(allControls, documentedIds) {
   const byBase = {};
   for (const id of documentedIds) {
@@ -239,12 +279,10 @@ function buildEmassRows(allControls, documentedIds) {
   }
   const rows = [];
   for (const base of Object.keys(byBase).sort((a,b)=>a.localeCompare(b, undefined, {numeric:true}))) {
-    const ids = byBase[base].sort((a,b)=>a.length-b.length); // base control first, then enhancements
+    const ids = byBase[base].sort((a,b)=>a.length-b.length);
     const fam = base.split("-")[0];
     const baseEntry = allControls[base];
 
-    // Overall status: if base is documented use its status; otherwise derive
-    // from enhancements (Partial if mixed, Gap if all gaps).
     let status;
     if (baseEntry) status = baseEntry.sctmStatus;
     else {
@@ -253,13 +291,11 @@ function buildEmassRows(allControls, documentedIds) {
         : statuses.every(s=>s==="Matched") ? "Implemented" : "Partially Implemented";
     }
 
-    // Build narrative: base statement first, then a short note per enhancement
     let narrative = baseEntry?.implementationStatement || `${base}: not yet documented in SSP.`;
     const enhancementIds = ids.filter(i=>i!==base);
     for (const eid of enhancementIds) {
       const e = allControls[eid];
-      const tag = `${eid}`;
-      const note = e.gap ? `${tag}: gap — ${e.gapReason}` : `${tag}: ${e.implementationStatement}`;
+      const note = e.gap ? `${eid}: gap — ${e.gapReason}` : `${eid}: ${e.implementationStatement}`;
       const candidate = narrative + "\n" + note;
       if (candidate.length <= EMASS_NARRATIVE_LIMIT) narrative = candidate;
       else { narrative = narrative.slice(0, EMASS_NARRATIVE_LIMIT - 15) + "... [truncated]"; break; }
@@ -270,7 +306,6 @@ function buildEmassRows(allControls, documentedIds) {
       ?? (ids.map(i=>allControls[i].origination).includes("Inherited") ? "Common" : "System-Specific");
     const inherited = ids.some(i=>allControls[i].origination==="Inherited");
 
-    // Roll up CCIs from the base control and any documented enhancements, deduped
     const cciSet = new Set();
     for (const i of ids) (allControls[i].ccis || []).forEach(c=>cciSet.add(c));
     const ccis = [...cciSet].sort().join(", ");
@@ -301,7 +336,7 @@ function buildEmassWorkbook(allControls, documentedIds) {
   return wb;
 }
 
-// ── UI bits ───────────────────────────────────────────────────────────────────
+// ── UI components ─────────────────────────────────────────────────
 function DropZone({label, accept, icon, onFiles, files, color, multi}) {
   const [dragging,setDragging]=useState(false);
   const inputRef=useRef();
@@ -384,15 +419,49 @@ function ControlCard({control}) {
   );
 }
 
+// ── Auth prompt overlay ───────────────────────────────────────────
+function AuthPrompt({onSubmit}) {
+  const [input,setInput]=useState("");
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999}}>
+      <div style={{background:C.white,borderRadius:12,padding:"28px 32px",width:400,maxWidth:"90vw",boxShadow:"0 8px 32px rgba(0,0,0,0.4)"}}>
+        <div style={{fontSize:20,fontWeight:800,color:C.navy,marginBottom:8}}>🔐 API Token Required</div>
+        <div style={{fontSize:12,color:C.gray,marginBottom:18,lineHeight:1.6}}>
+          The server requires an API token. Enter the value of <code style={{background:C.grayLight,padding:"1px 5px",borderRadius:3}}>AUTH_TOKEN</code> from your <code style={{background:C.grayLight,padding:"1px 5px",borderRadius:3}}>server/.env</code> file.
+        </div>
+        <input
+          autoFocus
+          type="password"
+          placeholder="Paste token here…"
+          value={input}
+          onChange={e=>setInput(e.target.value)}
+          onKeyDown={e=>{ if(e.key==="Enter"&&input.trim()) onSubmit(input.trim()); }}
+          style={{width:"100%",boxSizing:"border-box",border:`1px solid ${C.steel}`,borderRadius:7,padding:"9px 12px",fontSize:13,marginBottom:12,outline:"none"}}
+        />
+        <button
+          disabled={!input.trim()}
+          onClick={()=>onSubmit(input.trim())}
+          style={{width:"100%",background:input.trim()?`linear-gradient(135deg,${C.steel},${C.navyMid})`:C.grayLight,color:input.trim()?C.white:C.grayMid,border:"none",borderRadius:8,padding:"10px",fontWeight:700,fontSize:13,cursor:input.trim()?"pointer":"not-allowed"}}>
+          Connect
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Main app ──────────────────────────────────────────────────────
 export default function App() {
+  const [authToken, setAuthToken] = useState(getStoredToken);
+  const [showAuthPrompt, setShowAuthPrompt] = useState(false);
+
   const [sspFiles, setSSPFiles] = useState(null);
   const [stage, setStage] = useState("idle");
-  const [stepState, setStepState] = useState({1:"idle",2:"idle",3:"idle",4:"idle",5:"idle"});
+  const [stepState, setStepState] = useState({1:"idle",2:"idle",3:"idle"});
   const [progress, setProgress] = useState({s2:{done:0,total:0}});
   const [log, setLog] = useState([]);
   const [error, setError] = useState(null);
 
-  const [allControls, setAllControls] = useState({}); // controlId -> {family, statement, status, ..., mapped}
+  const [allControls, setAllControls] = useState({});
   const [loadingStorage, setLoadingStorage] = useState(true);
   const [view, setView] = useState("dashboard");
   const [activeTab, setActiveTab] = useState("all");
@@ -405,23 +474,41 @@ export default function App() {
     setTimeout(()=>{if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;},40);
   };
 
-  // Check backend / LLM provider connectivity on mount
+  function handleAuthRequired() {
+    setShowAuthPrompt(true);
+    setStage("idle");
+    setStepState({1:"idle",2:"idle",3:"idle"});
+  }
+
+  function submitToken(t) {
+    storeToken(t);
+    setAuthToken(t);
+    setShowAuthPrompt(false);
+    // Re-load storage with the new token
+    setLoadingStorage(true);
+    loadAllControls(t).then(stored => {
+      setAllControls(stored);
+      setLoadingStorage(false);
+      if (Object.keys(stored).length>0) addLog(`Loaded ${Object.keys(stored).length} previously documented controls from storage.`);
+    });
+  }
+
   useEffect(() => {
     (async () => {
       try {
         const r = await fetch(`${API_BASE}/api/health`);
         const info = await r.json();
         setBackendInfo(info);
+        if (info.authEnabled && !authToken) setShowAuthPrompt(true);
       } catch {
         setBackendInfo({ ok:false });
       }
     })();
   }, []);
 
-  // Load existing progress on mount
   useEffect(() => {
     (async () => {
-      const stored = await loadAllControls();
+      const stored = await loadAllControls(authToken);
       setAllControls(stored);
       setLoadingStorage(false);
       if (Object.keys(stored).length>0) addLog(`Loaded ${Object.keys(stored).length} previously documented controls from storage.`);
@@ -429,7 +516,7 @@ export default function App() {
   }, []);
 
   async function resetProgress() {
-    await clearAllControls();
+    await clearAllControls(authToken);
     setAllControls({});
     addLog("Progress reset — all stored control data cleared.", "warn");
   }
@@ -437,15 +524,28 @@ export default function App() {
   async function runPipeline() {
     if (!sspFiles || sspFiles.length===0) { setError("Upload an SSP — even a single page covering one control works."); return; }
     setError(null); setStage("running"); setLog([]);
-    setStepState({1:"active",2:"idle",3:"idle",4:"idle",5:"idle"});
+    setStepState({1:"active",2:"idle",3:"idle"});
     setProgress({s2:{done:0,total:0}});
 
     try {
-      // ── STEP 1: Extract ──────────────────────────────────────────────────
+      // ── STEP 1: Parse + extract ───────────────────────────────────
       const fileList = Array.from(sspFiles);
-      addLog(`Reading ${fileList.length} SSP file${fileList.length>1?"s":""}: ${fileList.map(f=>f.name).join(", ")}`);
-      const sspText = await parseSSPFiles(sspFiles);
-      addLog(`SSP text: ${sspText.length.toLocaleString()} characters.`);
+      addLog(`Parsing ${fileList.length} file${fileList.length>1?"s":""}: ${fileList.map(f=>f.name).join(", ")}`);
+
+      let sspText;
+      try {
+        sspText = await parseSSPFiles(sspFiles, authToken);
+      } catch(e) {
+        if (e.message==="AUTH_REQUIRED") { handleAuthRequired(); return; }
+        throw e;
+      }
+      addLog(`Extracted text: ${sspText.length.toLocaleString()} characters.`);
+
+      let sspSnippet = sspText;
+      if (sspText.length > MAX_SSP_EXTRACT_CHARS) {
+        sspSnippet = sspText.slice(0, MAX_SSP_EXTRACT_CHARS);
+        addLog(`⚠ Document is ${sspText.length.toLocaleString()} chars — sending first ${MAX_SSP_EXTRACT_CHARS.toLocaleString()} chars for extraction. Split into smaller uploads to cover the full document.`, "warn");
+      }
 
       addLog("AI extracting control implementation statements…");
       const sys1 = `You are a federal cybersecurity analyst. Extract ALL NIST 800-53 Rev 5 control implementation statements from SSP text.
@@ -453,14 +553,21 @@ Return ONLY a valid JSON array, no markdown, no preamble.
 Each element: {"id":"AC-2","family":"AC","statement":"...","status":"Implemented|Partially Implemented|Planned|Not Applicable"}
 The document may cover just one control or many. Extract whatever is present.
 Return [] if none found.`;
-      const raw1 = await callClaude(sys1, `Extract all control statements:\n\n${sspText.slice(0,22000)}`, 4000);
+
+      let raw1;
+      try {
+        raw1 = await callClaude(sys1, `Extract all control statements:\n\n${sspSnippet}`, 8000, authToken);
+      } catch(e) {
+        if (e.message==="AUTH_REQUIRED") { handleAuthRequired(); return; }
+        throw e;
+      }
+
       let statements = extractJSON(raw1);
       if (!Array.isArray(statements)) {
         addLog(`⚠ Could not parse JSON from model response. Raw response (first 600 chars): ${raw1.slice(0,600)}`, "warn");
         statements = [];
       }
 
-      // Filter to valid baseline controls only
       const beforeFilter = statements.length;
       statements = statements.filter(s => s && s.id && BASELINE_SET.has(String(s.id).toUpperCase().trim()));
       if (beforeFilter > 0 && statements.length === 0) {
@@ -471,14 +578,14 @@ Return [] if none found.`;
       if (statements.length===0) {
         addLog("No recognizable NIST 800-53 Rev 5 control statements found in this document.", "warn");
         setStage("done");
-        setStepState({1:"done",2:"done",3:"done",4:"done",5:"done"});
+        setStepState({1:"done",2:"done",3:"done"});
         return;
       }
 
-      setStepState({1:"done",2:"active",3:"idle",4:"idle",5:"idle"});
+      setStepState({1:"done",2:"active",3:"idle"});
       setProgress({s2:{done:0,total:statements.length}});
 
-      // ── STEP 2-4 combined per control: SCTM row + eMASS row + gap/POAM ──
+      // ── STEP 2: SCTM + eMASS + gap per control ───────────────────
       addLog(`Generating SCTM + eMASS + POA&M data for ${statements.length} control(s)…`);
       const sys2 = `You are a federal ISSO building SCTM and eMASS data for NIST SP 800-53 Rev 5 from an SSP statement.
 You will be given the OFFICIAL NIST control text and discussion for context — use it to judge whether the
@@ -498,11 +605,17 @@ Return ONLY valid JSON, no markdown. Keys:
       const mapOne = async (s) => {
         const controlId = s.id.toUpperCase();
         const fam = controlId.split("-")[0];
-        const catalogEntry = await getCatalogEntry(controlId);
+        const catalogEntry = await getCatalogEntry(controlId, authToken);
         const catalogContext = catalogEntry
           ? `\n\nOFFICIAL NIST CONTROL TEXT (${controlId} — ${catalogEntry.name}):\n${catalogEntry.text}\n\nOFFICIAL NIST DISCUSSION/GUIDANCE:\n${catalogEntry.discussion}`
           : "";
-        const raw = await callClaude(sys2, `Control: ${controlId}\nSSP Statement: ${s.statement}\nDeclared Status: ${s.status}${catalogContext}`, 800);
+        let raw;
+        try {
+          raw = await callClaude(sys2, `Control: ${controlId}\nSSP Statement: ${s.statement}\nDeclared Status: ${s.status}${catalogContext}`, 800, authToken);
+        } catch(e) {
+          if (e.message==="AUTH_REQUIRED") throw e;
+          raw = "";
+        }
         let mapped = extractJSON(raw);
         if (!mapped || typeof mapped !== "object" || Array.isArray(mapped)) {
           mapped = {
@@ -512,8 +625,6 @@ Return ONLY valid JSON, no markdown. Keys:
             emass_control_information: FAMILY_NAMES[fam]??"", emass_security_designation:"System-Specific",
           };
         }
-        // Guidance comes from the official catalog discussion, not AI generation —
-        // truncated for storage; full text always available via /api/catalog/:id.
         const nistGuidance = catalogEntry?.discussion
           ? catalogEntry.discussion.slice(0, 600) + (catalogEntry.discussion.length>600 ? "…" : "")
           : `Refer to NIST SP 800-53A assessment procedures for ${controlId}.`;
@@ -521,12 +632,18 @@ Return ONLY valid JSON, no markdown. Keys:
         return { controlId, fam, statement:s.statement, mapped, nistGuidance, ccis: catalogEntry?.ccis || [], cardStatus };
       };
 
-      const results = await processBatch(statements, 5, 900, mapOne,
-        (done,total)=>{ setProgress(p=>({...p,s2:{done,total}})); addLog(`[Step 2-4] Processed ${done}/${total}…`); });
+      let results;
+      try {
+        results = await processBatch(statements, 5, 900, mapOne,
+          (done,total)=>{ setProgress(p=>({...p,s2:{done,total}})); addLog(`[Step 2] Processed ${done}/${total}…`); });
+      } catch(e) {
+        if (e.message==="AUTH_REQUIRED") { handleAuthRequired(); return; }
+        throw e;
+      }
 
-      setStepState({1:"done",2:"done",3:"done",4:"done",5:"active"});
+      setStepState({1:"done",2:"done",3:"active"});
 
-      // Save each control to persistent storage
+      // ── STEP 3: Save to persistent storage ───────────────────────
       const updated = {...allControls};
       for (const r of results) {
         const entry = {
@@ -543,12 +660,12 @@ Return ONLY valid JSON, no markdown. Keys:
           updatedAt: Date.now(),
         };
         updated[r.controlId] = entry;
-        await saveControl(r.controlId, entry);
+        await saveControl(r.controlId, entry, authToken);
       }
-      addLog(`Saved ${results.length} control(s) to persistent storage. Total documented: ${Object.keys(updated).length}/${FULL_BASELINE.length}.`);
+      addLog(`Saved ${results.length} control(s). Total documented: ${Object.keys(updated).length}/${FULL_BASELINE.length}.`);
 
       setAllControls(updated);
-      setStepState({1:"done",2:"done",3:"done",4:"done",5:"done"});
+      setStepState({1:"done",2:"done",3:"done"});
       setStage("done");
       addLog("✅ Done. Dashboard updated with cumulative progress.", "success");
 
@@ -564,7 +681,6 @@ Return ONLY valid JSON, no markdown. Keys:
   const totalDocumented = documentedIds.length;
   const overallPct = Math.round((totalDocumented/FULL_BASELINE.length)*100);
 
-  // Build control cards for ALL 323 (documented = real data, undocumented = placeholder gap)
   const allCards = FULL_BASELINE.map(id => {
     const fam = id.split("-")[0];
     if (allControls[id]) {
@@ -587,7 +703,6 @@ Return ONLY valid JSON, no markdown. Keys:
     return famOk&&tabOk;
   });
 
-  // Family summary for dashboard
   const familySummaries = Object.keys(FAMILY_NAMES).map(fam=>{
     const famControls = FULL_BASELINE.filter(id=>id.startsWith(fam+"-"));
     const documented = famControls.filter(id=>allControls[id]);
@@ -606,20 +721,9 @@ Return ONLY valid JSON, no markdown. Keys:
       phases:[phase1,phase2,phase3,phase4,phase5] };
   });
 
-  // Downloads — fixed formats, built from cumulative documented controls
-  function downloadSCTM() {
-    const wb = buildSCTMWorkbook(allControls, documentedIds);
-    XLSX.writeFile(wb, "SCTM_Rev5.xlsx");
-    addLog(`SCTM exported — ${documentedIds.length} controls across 20 family tabs.`);
-  }
-  function downloadeMASSFile() {
-    const wb = buildEmassWorkbook(allControls, documentedIds);
-    const rowCount = buildEmassRows(allControls, documentedIds).length;
-    XLSX.writeFile(wb, "eMASS_Upload_Rev5.xlsx");
-    addLog(`eMASS export — ${rowCount} base-control rows (enhancements rolled up, ≤2000 chars each).`);
-  }
-  function buildPOAM() {
-    return documentedIds.filter(id=>allControls[id].gap).map(id=>{
+  // Memoized export data — only recomputed when allControls changes
+  const poamRows = useMemo(() =>
+    documentedIds.filter(id=>allControls[id].gap).map(id=>{
       const c = allControls[id]; const fam = id.split("-")[0];
       return {
         "POA&M ID":`POAM-${id.replace(/[^A-Z0-9]/g,"")}`, "Control ID":id,
@@ -627,20 +731,38 @@ Return ONLY valid JSON, no markdown. Keys:
         "Recommended Actions":c.aiSuggestion, "Status":"Ongoing",
         "Est Completion Date":"", "Responsible POC":"", "Resource Estimate":"",
       };
-    });
+    }),
+  [allControls]);
+
+  const emassRowCount = useMemo(() =>
+    buildEmassRows(allControls, documentedIds).length,
+  [allControls]);
+
+  function downloadSCTM() {
+    const wb = buildSCTMWorkbook(allControls, documentedIds);
+    XLSX.writeFile(wb, "SCTM_Rev5.xlsx");
+    addLog(`SCTM exported — ${documentedIds.length} controls across 20 family tabs.`);
   }
-  function buildTracker() {
-    return familySummaries.map(f=>({
+  function downloadeMASSFile() {
+    const wb = buildEmassWorkbook(allControls, documentedIds);
+    XLSX.writeFile(wb, "eMASS_Upload_Rev5.xlsx");
+    addLog(`eMASS export — ${emassRowCount} base-control rows (enhancements rolled up, ≤2000 chars each).`);
+  }
+  function downloadTracker() {
+    const rows = familySummaries.map(f=>({
       "Family ID":f.id, "Family Name":f.name,
       "Total Controls":f.total, "Documented":f.documented, "Undocumented":f.undocumented,
       "Matched":f.matched, "Partial":f.partial, "Gaps":f.gaps, "Inherited":f.inherited,
       "Phase 1 - Gap Analysis":f.phases[0], "Phase 2 - SSP/Policy":f.phases[1],
       "Phase 3 - Evidence":f.phases[2], "Phase 4 - eMASS Entry":f.phases[3], "Phase 5 - AO Review":f.phases[4],
     }));
+    downloadExcel(rows, "Migration_Tracker.xlsx", "Tracker");
   }
 
   return (
     <div style={{fontFamily:"'Inter','Arial',sans-serif",background:C.navy,minHeight:"100vh",paddingBottom:40}}>
+      {showAuthPrompt && <AuthPrompt onSubmit={submitToken}/>}
+
       <div style={{background:`linear-gradient(135deg,${C.navy},${C.navyMid})`,padding:"20px 26px 16px",borderBottom:`3px solid ${C.steel}`}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
           <div style={{display:"flex",alignItems:"center",gap:11}}>
@@ -650,9 +772,17 @@ Return ONLY valid JSON, no markdown. Keys:
               <div style={{color:"#8AAFC8",fontSize:11,marginTop:1}}>Upload SSP content one control (or one family) at a time — progress accumulates automatically</div>
             </div>
           </div>
-          <div style={{textAlign:"right"}}>
-            <div style={{color:C.white,fontWeight:800,fontSize:22}}>{totalDocumented} / {FULL_BASELINE.length}</div>
-            <div style={{color:"#8AAFC8",fontSize:10,fontWeight:600}}>controls documented ({overallPct}%)</div>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            {authToken && (
+              <button onClick={()=>{storeToken("");setAuthToken("");setShowAuthPrompt(true);}}
+                style={{background:"none",border:`1px solid ${C.steel}`,color:"#8AAFC8",borderRadius:6,padding:"3px 9px",fontSize:10,cursor:"pointer"}}>
+                🔐 Re-auth
+              </button>
+            )}
+            <div style={{textAlign:"right"}}>
+              <div style={{color:C.white,fontWeight:800,fontSize:22}}>{totalDocumented} / {FULL_BASELINE.length}</div>
+              <div style={{color:"#8AAFC8",fontSize:10,fontWeight:600}}>controls documented ({overallPct}%)</div>
+            </div>
           </div>
         </div>
       </div>
@@ -670,6 +800,7 @@ Return ONLY valid JSON, no markdown. Keys:
               <span>provider: <strong style={{color:"#fff"}}>{backendInfo.provider}</strong></span>
               <span>model: <strong style={{color:"#fff"}}>{backendInfo.model}</strong></span>
               <span>endpoint: {backendInfo.baseUrl}</span>
+              {backendInfo.authEnabled && <span style={{color:"#27AE60",fontWeight:700}}>🔐 auth: on</span>}
               {!backendInfo.apiKeyConfigured && (
                 <span style={{color:"#F39C12",fontWeight:700}}>⚠ LLM_API_KEY not set in server/.env — pipeline runs will fail</span>
               )}
@@ -682,7 +813,6 @@ Return ONLY valid JSON, no markdown. Keys:
 
       <div style={{padding:"20px 26px",maxWidth:1100,margin:"0 auto"}}>
 
-        {/* Cumulative progress bar */}
         <div style={{background:C.white,borderRadius:12,border:"1px solid #DDE6EF",padding:"14px 18px",marginBottom:14}}>
           <ProgressBar value={totalDocumented} max={FULL_BASELINE.length} label="Overall baseline coverage (cumulative across all uploads)" color={C.green}/>
           {totalDocumented>0 && (
@@ -692,35 +822,31 @@ Return ONLY valid JSON, no markdown. Keys:
           )}
         </div>
 
-        {/* Upload */}
         <div style={{background:C.white,borderRadius:12,border:"1px solid #DDE6EF",padding:"16px 18px",marginBottom:14}}>
           <div style={{fontWeight:700,color:C.navy,fontSize:13,marginBottom:4}}>Upload SSP Content</div>
           <div style={{fontSize:11,color:C.grayMid,marginBottom:12}}>
             Upload as little or as much as you have — a single control's writeup, one family's document, or a full SSP.
-            AI only processes what's in this file. Already-documented controls stay saved; new ones are added to your running total.
+            Accepts <strong>.docx</strong>, <strong>.pdf</strong>, and <strong>.txt</strong> files. Already-documented controls stay saved; new ones are added to your running total.
           </div>
-          <DropZone label="SSP document(s) — .docx, any size, 1 control or many" accept=".docx" icon="📄" multi onFiles={setSSPFiles} files={sspFiles} color={C.steel}/>
+          <DropZone label="SSP document(s) — .docx / .pdf / .txt, 1 control or many" accept=".docx,.pdf,.txt" icon="📄" multi onFiles={setSSPFiles} files={sspFiles} color={C.steel}/>
         </div>
 
-        {/* Output format note */}
         <div style={{background:C.white,borderRadius:12,border:"1px solid #DDE6EF",padding:"14px 18px",marginBottom:14,display:"flex",gap:18,alignItems:"center",flexWrap:"wrap"}}>
           <div style={{fontSize:11,color:C.grayMid,lineHeight:1.6}}>
             <strong style={{color:C.navy}}>Standard output formats:</strong> SCTM is always a 20-tab workbook (one tab
             per control family, fixed headers including a <strong>Guidance</strong> column). eMASS export is one row
             per <strong>base control</strong> (enhancements rolled up into the narrative, ≤2,000 chars per the eMASS
-            limit). Guidance text comes directly from the official NIST SP 800-53 Rev 5 control catalog —
-            grounding every gap analysis in the real control text and discussion.
+            limit). Guidance text comes directly from the official NIST SP 800-53 Rev 5 control catalog.
           </div>
         </div>
 
-        {/* Run */}
         <div style={{background:C.white,borderRadius:12,border:"1px solid #DDE6EF",padding:"16px 18px",marginBottom:14}}>
           <div style={{display:"flex",gap:14,flexWrap:"wrap",alignItems:"center",marginBottom:10}}>
-            <StepBadge n={1} label="Extract from SSP" state={stepState[1]}/>
+            <StepBadge n={1} label="Parse + Extract from SSP" state={stepState[1]}/>
             <span style={{color:"#CCC"}}>▶</span>
             <StepBadge n={2} label="SCTM + eMASS + Gap Check" state={stepState[2]}/>
             <span style={{color:"#CCC"}}>▶</span>
-            <StepBadge n={3} label="Save to Tracker" state={stepState[5]}/>
+            <StepBadge n={3} label="Save to Tracker" state={stepState[3]}/>
           </div>
           {running && progress.s2.total>0 && <ProgressBar value={progress.s2.done} max={progress.s2.total} label="Processing controls found in this upload" color={C.accent}/>}
           <button onClick={runPipeline} disabled={running||!sspFiles} style={{
@@ -781,9 +907,9 @@ Return ONLY valid JSON, no markdown. Keys:
                   <div style={{fontSize:11,color:C.grayMid,marginBottom:10}}>Reflects all {totalDocumented} controls documented so far across all uploads.</div>
                   <div style={{display:"flex",gap:9,flexWrap:"wrap"}}>
                     <button disabled={totalDocumented===0} onClick={downloadSCTM} style={{background:totalDocumented?`linear-gradient(135deg,${C.green},#145C30)`:C.grayLight,color:totalDocumented?C.white:C.grayMid,border:"none",borderRadius:7,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:totalDocumented?"pointer":"not-allowed"}}>📊 SCTM — 20 tabs ({totalDocumented} controls)</button>
-                    <button disabled={totalDocumented===0} onClick={downloadeMASSFile} style={{background:totalDocumented?`linear-gradient(135deg,${C.purple},#4A235A)`:C.grayLight,color:totalDocumented?C.white:C.grayMid,border:"none",borderRadius:7,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:totalDocumented?"pointer":"not-allowed"}}>🗄️ eMASS — base controls ({buildEmassRows(allControls,documentedIds).length})</button>
-                    <button disabled={buildPOAM().length===0} onClick={()=>downloadExcel(buildPOAM(),"POAM_Cumulative.xlsx","POA&M")} style={{background:buildPOAM().length?`linear-gradient(135deg,${C.red},#9B2D23)`:C.grayLight,color:buildPOAM().length?C.white:C.grayMid,border:"none",borderRadius:7,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:buildPOAM().length?"pointer":"not-allowed"}}>🔴 POA&M ({buildPOAM().length})</button>
-                    <button onClick={()=>downloadExcel(buildTracker(),"Migration_Tracker.xlsx","Tracker")} style={{background:`linear-gradient(135deg,${C.steel},${C.navyMid})`,color:C.white,border:"none",borderRadius:7,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:"pointer"}}>📋 Tracker (20 families)</button>
+                    <button disabled={totalDocumented===0} onClick={downloadeMASSFile} style={{background:totalDocumented?`linear-gradient(135deg,${C.purple},#4A235A)`:C.grayLight,color:totalDocumented?C.white:C.grayMid,border:"none",borderRadius:7,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:totalDocumented?"pointer":"not-allowed"}}>🗄️ eMASS — base controls ({emassRowCount})</button>
+                    <button disabled={poamRows.length===0} onClick={()=>downloadExcel(poamRows,"POAM_Cumulative.xlsx","POA&M")} style={{background:poamRows.length?`linear-gradient(135deg,${C.red},#9B2D23)`:C.grayLight,color:poamRows.length?C.white:C.grayMid,border:"none",borderRadius:7,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:poamRows.length?"pointer":"not-allowed"}}>🔴 POA&M ({poamRows.length})</button>
+                    <button onClick={downloadTracker} style={{background:`linear-gradient(135deg,${C.steel},${C.navyMid})`,color:C.white,border:"none",borderRadius:7,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:"pointer"}}>📋 Tracker (20 families)</button>
                   </div>
                 </div>
 
