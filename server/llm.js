@@ -7,6 +7,8 @@
 // back a plain string of the model's text response.
 // ─────────────────────────────────────────────────────────────────
 
+import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
+
 const PROVIDER  = process.env.LLM_PROVIDER  || "openai";
 const BASE_URL  = (process.env.LLM_BASE_URL || "https://api.deepseek.com").replace(/\/+$/, "");
 const MODEL     = process.env.LLM_MODEL     || "deepseek-chat";
@@ -77,6 +79,31 @@ async function callAnthropicNative(system, user, maxTokens) {
 }
 
 /**
+ * AWS Bedrock Converse API.
+ * Auth via the AWS SDK default credential chain: IAM role, environment variables
+ * (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN), or ~/.aws/credentials.
+ * No LLM_API_KEY is needed. Set AWS_REGION (default: us-east-1) and
+ * LLM_MODEL to the Bedrock model ID, e.g.:
+ *   anthropic.claude-sonnet-4-20250514-v1:0
+ *   amazon.nova-pro-v1:0
+ *   meta.llama3-70b-instruct-v1:0
+ * For GovCloud use AWS_REGION=us-gov-west-1 (not all models available there).
+ */
+async function callBedrock(system, user, maxTokens) {
+  const client = new BedrockRuntimeClient({
+    region: process.env.AWS_REGION || "us-east-1",
+  });
+  const cmd = new ConverseCommand({
+    modelId: MODEL,
+    system: system ? [{ text: system }] : undefined,
+    messages: [{ role: "user", content: [{ text: user }] }],
+    inferenceConfig: { maxTokens },
+  });
+  const response = await client.send(cmd);
+  return response.output?.message?.content?.[0]?.text ?? "";
+}
+
+/**
  * Main entry point. Retries with backoff on rate limits / transient errors.
  */
 export async function callLLM(system, user, maxTokens = 900) {
@@ -85,13 +112,16 @@ export async function callLLM(system, user, maxTokens = 900) {
       switch (PROVIDER) {
         case "anthropic":
           return await callAnthropicNative(system, user, maxTokens);
+        case "bedrock":
+          return await callBedrock(system, user, maxTokens);
         case "openai":
         default:
           return await callOpenAICompatible(system, user, maxTokens);
       }
     } catch (err) {
       const msg = String(err.message || "");
-      const isRateLimit = msg.includes("429") || msg.includes("529") || msg.includes("rate");
+      const isRateLimit = msg.includes("429") || msg.includes("529") || msg.includes("rate")
+        || msg.includes("ThrottlingException") || msg.includes("ServiceUnavailableException");
       if (attempt === 3) throw err;
       await sleep(isRateLimit ? (attempt + 1) * 5000 : (attempt + 1) * 2000);
     }
@@ -99,4 +129,4 @@ export async function callLLM(system, user, maxTokens = 900) {
   return "";
 }
 
-export const config = { PROVIDER, BASE_URL, MODEL, hasKey: !!API_KEY };
+export const config = { PROVIDER, BASE_URL, MODEL, hasKey: PROVIDER === "bedrock" ? true : !!API_KEY };

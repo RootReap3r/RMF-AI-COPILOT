@@ -3,6 +3,22 @@ services:
     build: .
     image: nist-rev5-pipeline:latest
     ports:
+      # HTTP only — suitable for localhost or a private network behind a VPN.
+      # For HTTPS in production, place a reverse proxy in front of this container:
+      #
+      #   Option A — Nginx (recommended for on-prem / GovCloud):
+      #     1. Add an nginx service to this file that listens on 443.
+      #     2. Obtain a cert (Let's Encrypt / certbot, or your org's CA).
+      #     3. Proxy HTTPS -> http://nist-pipeline:3001.
+      #     4. Set CORS_ORIGIN=https://your-domain in server/.env.
+      #
+      #   Option B — AWS Application Load Balancer (ECS/Fargate):
+      #     1. Create an ALB listener on port 443 with an ACM certificate.
+      #     2. Target group -> container port 3001 (HTTP).
+      #     3. Remove the port mapping below (ALB reaches the container directly).
+      #
+      #   Option C — Cloudflare Tunnel / Tailscale Funnel (zero-config):
+      #     Run the tunnel agent alongside this container; no cert management needed.
       - "3001:3001"
     env_file:
       - server/.env
