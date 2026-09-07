@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "test": "node --test tests/security.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.600.0",
@@ -19,6 +20,6 @@
     "pdf-parse": "^2.4.5"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   }
 }

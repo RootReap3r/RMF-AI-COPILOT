@@ -19,10 +19,15 @@ services:
       #
       #   Option C — Cloudflare Tunnel / Tailscale Funnel (zero-config):
       #     Run the tunnel agent alongside this container; no cert management needed.
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
+    mem_limit: 512m
+    pids_limit: 64
+    environment:
+      HOST: 0.0.0.0
     env_file:
       - server/.env
     volumes:
       # Persist documented-controls progress across container restarts
       - ./server/data:/app/server/data
     restart: unless-stopped
+
