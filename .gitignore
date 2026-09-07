@@ -2,3 +2,5 @@ node_modules/
 dist/
 server/.env
 server/data/storage.json
+__pycache__/
+*.pyc

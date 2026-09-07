@@ -222,3 +222,15 @@ given network is:
 Nothing in this codebase calls out to the public internet except the
 single configurable LLM endpoint — there's no telemetry, analytics, or
 external dependencies fetched at runtime once built.
+
+## Secure deployment
+
+Set `AUTH_TOKEN` before starting the backend; it must contain at least 32 characters. Generate a fresh value with `openssl rand -hex 32` and put it in the untracked `server/.env`. The UI prompts for this token on the first protected request and retains it in memory only. This remains a single shared workspace, not a multi-tenant service.
+
+The Node process binds to `127.0.0.1` by default. Compose binds the host port to loopback and sets the container's `HOST=0.0.0.0`. Put a TLS reverse proxy in front for remote access and configure explicit `CORS_ORIGIN` values. Do not publish the container port directly.
+
+Document uploads accept at most four files of 5 MiB each, with two active upload/parse jobs and ten uploads per minute per IP. Files are spooled to temporary disk and deleted after processing. Each parser runs in a child process with a 128 MiB V8 heap, ten-second deadline, and 2 MiB output cap; total returned text is also capped at 2 MiB. Compose limits the container to 512 MiB. For non-Compose deployments, apply an equivalent OS/container memory limit: a V8 heap limit does not cap all native allocations. The frontend still supports locally parsed documents; this hardening applies to the server upload endpoint.
+
+Validation: `cd server && npm ci && node --test tests/security.test.js`. Tests exercise a real local HTTP server and text-file parser, missing/wrong credentials, oversized files, and excess file count. Real PDF/DOCX fixtures and the output cap are tested with `python -m unittest discover -s server/tests -p test_documents.py -v` from the repository root.
+
+Runtime: Node.js 22 or newer. Docker uses Node 22 and lockfile installs. The client manifest now declares its existing mammoth import; both package lockfiles were regenerated to match the manifests.

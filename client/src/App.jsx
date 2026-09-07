@@ -89,10 +89,28 @@ function extractJSON(raw) {
 // All LLM calls go through our own backend at /api/chat.
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 
+// Keep the shared deployment token in memory only; never bundle or persist it.
+let deploymentToken = "";
+async function apiFetch(url, options = {}) {
+  const send = () => fetch(url, { ...options, headers: {
+    ...options.headers, ...(deploymentToken ? { "X-Api-Key": deploymentToken } : {}),
+  }});
+  const attemptedToken = deploymentToken;
+  let response = await send();
+  if (response.status === 401 && deploymentToken !== attemptedToken) response = await send();
+  if (response.status === 401) {
+    const token = window.prompt("Enter the access token provided by your administrator:");
+    if (!token) throw new Error("An access token is required.");
+    deploymentToken = token.trim();
+    response = await send();
+  }
+  return response;
+}
+
 async function callClaude(system, user, maxTokens=900) {
   for (let attempt=0; attempt<4; attempt++) {
     try {
-      const resp = await fetch(`${API_BASE}/api/chat`, {
+      const resp = await apiFetch(`${API_BASE}/api/chat`, {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ system, user, maxTokens }),
       });
@@ -120,7 +138,7 @@ const catalogCache = {};
 async function getCatalogEntry(controlId) {
   if (catalogCache[controlId] !== undefined) return catalogCache[controlId];
   try {
-    const r = await fetch(`${API_BASE}/api/catalog/${encodeURIComponent(controlId)}`);
+    const r = await apiFetch(`${API_BASE}/api/catalog/${encodeURIComponent(controlId)}`);
     if (!r.ok) { catalogCache[controlId] = null; return null; }
     const data = await r.json();
     catalogCache[controlId] = data;
@@ -160,13 +178,13 @@ function downloadExcel(rows, filename, sheetName) {
 // ── Persistent storage helpers (backed by local JSON file via API) ───────────
 async function loadAllControls() {
   try {
-    const listResp = await fetch(`${API_BASE}/api/storage?prefix=ctrl:`);
+    const listResp = await apiFetch(`${API_BASE}/api/storage?prefix=ctrl:`);
     const { keys } = await listResp.json();
     if (!keys || keys.length===0) return {};
     const out = {};
     for (const key of keys) {
       try {
-        const r = await fetch(`${API_BASE}/api/storage/${encodeURIComponent(key)}`);
+        const r = await apiFetch(`${API_BASE}/api/storage/${encodeURIComponent(key)}`);
         if (!r.ok) continue;
         const { value } = await r.json();
         out[key.replace("ctrl:","")] = JSON.parse(value);
@@ -177,7 +195,7 @@ async function loadAllControls() {
 }
 async function saveControl(controlId, data) {
   try {
-    await fetch(`${API_BASE}/api/storage`, {
+    await apiFetch(`${API_BASE}/api/storage`, {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ key:"ctrl:"+controlId, value: JSON.stringify(data) }),
     });
@@ -185,7 +203,7 @@ async function saveControl(controlId, data) {
 }
 async function clearAllControls() {
   try {
-    await fetch(`${API_BASE}/api/storage/clear`, {
+    await apiFetch(`${API_BASE}/api/storage/clear`, {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ prefix:"ctrl:" }),
     });
@@ -409,7 +427,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch(`${API_BASE}/api/health`);
+        const r = await apiFetch(`${API_BASE}/api/health`);
         const info = await r.json();
         setBackendInfo(info);
       } catch {
@@ -865,3 +883,4 @@ Return ONLY valid JSON, no markdown. Keys:
     </div>
   );
 }
+
